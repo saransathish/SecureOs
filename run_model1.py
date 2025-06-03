@@ -1634,7 +1634,7 @@ def run_model(data_library, input_df, chosen_final_score_weightings):
 
     # Save outputs
     datetime_string = datetime.now().strftime('%Y-%m-%d %H-%M-%S')
-
+    
     user = os.getlogin()
     location = "ASEL"
     if user == "HannahPowell":
@@ -1673,7 +1673,7 @@ def run_model(data_library, input_df, chosen_final_score_weightings):
 
 # TESTING
 
-postcodes = pd.DataFrame(['1011 AB' , 'RG2 9UW', 'HP2 4JW', 'N7 6QD', 'SN2 8DA', 'TR7 2BB'],columns=['postcode'])
+postcodes = pd.DataFrame([ 'RG2 9UW', 'HP2 4JW', 'N7 6QD', 'SN2 8DA', 'TR7 2BB'],columns=['postcode'])
 # postcodes = ['RG2 9UW', 'HP2 4JW', 'N7 6QD', 'SN2 8DA', 'TR7 2BB']
 
 data_source_library = {

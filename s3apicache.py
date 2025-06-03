@@ -3,20 +3,107 @@ import pandas as pd
 import os
 import json
 import boto3
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pyarrow.csv as pv
 from flask import Flask, request, jsonify
 from botocore.exceptions import ClientError, NoCredentialsError
 import io
+import hashlib
+import threading
+from collections import OrderedDict
 from final_score_weightings import final_weightings as fsw
-from model import run_model , Api
+from model import run_model
+import cProfile
 
 # Set up logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
+
+class LRUCache:
+    """Thread-safe LRU Cache implementation"""
+    def __init__(self, capacity=100):
+        self.capacity = capacity
+        self.cache = OrderedDict()
+        self.lock = threading.Lock()
+    
+    def get(self, key):
+        with self.lock:
+            if key not in self.cache:
+                return None
+            # Move to end (most recently used)
+            value = self.cache.pop(key)
+            self.cache[key] = value
+            return value
+    
+    def put(self, key, value):
+        with self.lock:
+            if key in self.cache:
+                # Update existing key
+                self.cache.pop(key)
+            elif len(self.cache) >= self.capacity:
+                # Remove least recently used item
+                self.cache.popitem(last=False)
+            self.cache[key] = value
+    
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+    
+    def size(self):
+        with self.lock:
+            return len(self.cache)
+
+class DatasetCache:
+    """Cache for storing loaded datasets with expiration"""
+    def __init__(self, expiration_hours=24):
+        self.cache = {}
+        self.timestamps = {}
+        self.expiration_delta = timedelta(hours=expiration_hours)
+        self.lock = threading.Lock()
+    
+    def get(self, cache_key):
+        with self.lock:
+            if cache_key not in self.cache:
+                return None
+            
+            # Check if expired
+            if datetime.now() - self.timestamps[cache_key] > self.expiration_delta:
+                del self.cache[cache_key]
+                del self.timestamps[cache_key]
+                logging.info(f"Cache expired for key: {cache_key}")
+                return None
+            
+            logging.info(f"Cache hit for datasets: {cache_key}")
+            return self.cache[cache_key]
+    
+    def put(self, cache_key, data):
+        with self.lock:
+            self.cache[cache_key] = data
+            self.timestamps[cache_key] = datetime.now()
+            logging.info(f"Cached datasets with key: {cache_key}")
+    
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+            self.timestamps.clear()
+    
+    def get_cache_stats(self):
+        with self.lock:
+            total_size = len(self.cache)
+            expired_count = sum(1 for ts in self.timestamps.values() 
+                              if datetime.now() - ts > self.expiration_delta)
+            return {
+                "total_entries": total_size,
+                "expired_entries": expired_count,
+                "active_entries": total_size - expired_count
+            }
+
+# Global cache instances
+dataset_cache = DatasetCache(expiration_hours=24)  # Datasets cached for 24 hours
+postcode_results_cache = LRUCache(capacity=1000)   # Results cached for 1000 most recent queries
 
 class S3DataManager:
     def __init__(self, bucket_name, aws_access_key_id=None, aws_secret_access_key=None, region_name='us-east-1'):
@@ -141,6 +228,26 @@ class S3DataManager:
             logging.error(f"Error generating presigned URL: {str(e)}")
             return None
 
+def generate_cache_key(s3_config, data_directory):
+    """Generate a cache key for dataset loading based on S3 config"""
+    key_components = [
+        s3_config.get('bucket_name', ''),
+        data_directory,
+        s3_config.get('region', 'us-east-1')
+    ]
+    key_string = '|'.join(key_components)
+    return hashlib.md5(key_string.encode()).hexdigest()
+
+def generate_postcode_cache_key(postcodes, category):
+    """Generate a cache key for postcode analysis results"""
+    # Sort postcodes to ensure consistent cache keys
+    sorted_postcodes = sorted(postcodes)
+    key_components = [
+        ','.join(sorted_postcodes),
+        category
+    ]
+    key_string = '|'.join(key_components)
+    return hashlib.md5(key_string.encode()).hexdigest()
 
 def create_s3_manager(bucket_name, aws_access_key_id=None, aws_secret_access_key=None, region='us-east-1'):
     """Create S3 manager with provided credentials"""
@@ -151,9 +258,16 @@ def create_s3_manager(bucket_name, aws_access_key_id=None, aws_secret_access_key
         region_name=region
     )
 
-
-def load_datasets_from_s3(s3_manager, data_source_mapping):
-    """Load all datasets from S3 in parallel"""
+def load_datasets_from_s3_with_cache(s3_manager, data_source_mapping, cache_key):
+    """Load all datasets from S3 with caching support"""
+    # Check cache first
+    cached_data = dataset_cache.get(cache_key)
+    if cached_data is not None:
+        logging.info("Using cached datasets")
+        return cached_data
+    
+    # Load from S3 if not in cache
+    logging.info("Loading datasets from S3 (not in cache)")
     dataframe_library = {}
     total_files = len(data_source_mapping)
     
@@ -181,8 +295,46 @@ def load_datasets_from_s3(s3_manager, data_source_mapping):
             except Exception as e:
                 logging.error(f"Error processing {name}: {str(e)}")
     
+    # Cache the loaded data
+    if dataframe_library:
+        dataset_cache.put(cache_key, dataframe_library)
+    
     return dataframe_library
 
+def check_postcode_subset_cache(requested_postcodes, category):
+    """Check if we have cached results that contain all requested postcodes"""
+    requested_set = set(requested_postcodes)
+    
+    # This is a simplified approach - in practice, you might want to store
+    # metadata about which postcodes are in each cached result
+    for i in range(postcode_results_cache.size()):
+        # In a more sophisticated implementation, you'd store postcode sets
+        # alongside results and check for supersets
+        pass
+    
+    return None
+
+def process_postcodes_with_cache(data_library, postcodes_list, category):
+    """Process postcodes with caching support"""
+    # Generate cache key for this specific request
+    postcode_cache_key = generate_postcode_cache_key(postcodes_list, category)
+    
+    # Check if exact results are cached
+    cached_results = postcode_results_cache.get(postcode_cache_key)
+    if cached_results is not None:
+        logging.info(f"Using cached results for {len(postcodes_list)} postcodes")
+        return cached_results, True  # True indicates cache hit
+    
+    # Run the model for new postcodes
+    postcodes_df = pd.DataFrame(postcodes_list, columns=['postcode'])
+    logging.info(f"Running model analysis for {len(postcodes_list)} postcodes (not in cache)")
+    
+    model_results = run_model(data_library, postcodes_df, fsw[category])
+    
+    # Cache the results
+    postcode_results_cache.put(postcode_cache_key, model_results)
+    
+    return model_results, False  # False indicates no cache hit
 
 def convert_results_to_json_format(results):
     """Convert model results to JSON serializable format"""
@@ -192,7 +344,12 @@ def convert_results_to_json_format(results):
         return {
             "primary_results": df1.to_dict('records') if hasattr(df1, 'to_dict') else df1,
             "secondary_results": df2.to_dict('records') if hasattr(df2, 'to_dict') else df2,
-            }
+            "result_type": "dual_dataframes",
+            "primary_columns": list(df1.columns) if hasattr(df1, 'columns') else [],
+            "secondary_columns": list(df2.columns) if hasattr(df2, 'columns') else [],
+            "primary_count": len(df1) if hasattr(df1, '__len__') else 0,
+            "secondary_count": len(df2) if hasattr(df2, '__len__') else 0
+        }
     elif isinstance(results, pd.DataFrame):
         # Single DataFrame
         return {
@@ -207,7 +364,6 @@ def convert_results_to_json_format(results):
             "results": results,
             "result_type": "other"
         }
-
 
 # Default data source mapping (relative paths)
 default_data_source_mapping = {
@@ -239,11 +395,10 @@ default_data_source_mapping = {
     "ni_homelessness": "Homelessness/ni_homelessness_for_script.csv"
 }
 
-
 @app.route('/analyze', methods=['POST'])
 def analyze_postcodes():
     """
-    Main API endpoint for postcode analysis
+    Main API endpoint for postcode analysis with caching
     Expected JSON payload:
     {
         "postcodes": ["1011 AB", "RG2 9UW", "HP2 4JW"],
@@ -258,6 +413,8 @@ def analyze_postcodes():
     }
     """
     try:
+        start_time = datetime.now()
+        
         # Parse request data
         data = request.get_json()
         
@@ -279,13 +436,14 @@ def analyze_postcodes():
         if not s3_config.get('bucket_name'):
             return jsonify({"error": "S3 bucket_name is required in s3_config"}), 400
         
-        # Convert postcodes to DataFrame
-        postcodes_df = pd.DataFrame(postcodes_list, columns=['postcode'])
-        
         logging.info(f"Processing {len(postcodes_list)} postcodes with category: {category}")
         logging.info(f"Using S3 bucket: {s3_config['bucket_name']}")
         
-        # Create S3 manager with provided config
+        # Generate cache keys
+        data_directory = s3_config.get('data_directory', 'Documents/DATA 2')
+        dataset_cache_key = generate_cache_key(s3_config, data_directory)
+        
+        # Create S3 manager
         s3_manager = create_s3_manager(
             bucket_name=s3_config['bucket_name'],
             aws_access_key_id=s3_config.get('aws_access_key_id'),
@@ -294,38 +452,54 @@ def analyze_postcodes():
         )
         
         # Build data source mapping with provided directory
-        data_directory = s3_config.get('data_directory', 'Documents/DATA 2')
         current_mapping = {
             name: f"{data_directory}/{path}" 
             for name, path in default_data_source_mapping.items()
         }
         
-        # Load datasets from S3
-        data_library = load_datasets_from_s3(s3_manager, current_mapping)
+        # Load datasets with caching
+        data_library = load_datasets_from_s3_with_cache(s3_manager, current_mapping, dataset_cache_key)
         
         if not data_library:
             return jsonify({"error": "Failed to load any datasets from S3"}), 500
         
-        # Run the model
-        logging.info("Running model analysis...")
-        model_results = run_model(data_library, postcodes_df, fsw[category])
+        dataset_load_time = datetime.now()
+        
+        # Process postcodes with caching
+        model_results, was_cached = process_postcodes_with_cache(data_library, postcodes_list, category)
+        
+        analysis_time = datetime.now()
         
         # Convert results to JSON format
         json_results = convert_results_to_json_format(model_results)
         
-        # Generate unique result key for S3
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        result_key = f"results/analysis_{timestamp}_{len(postcodes_list)}_postcodes.json"
-        
-        # Save results to S3
-        save_success, saved_results = s3_manager.save_results_to_s3(model_results, result_key)
-        
-        # Generate presigned URL for result download
+        # Generate unique result key for S3 (only if not from cache)
+        result_key = None
         download_url = None
-        if save_success:
-            download_url = s3_manager.generate_presigned_url(result_key)
+        save_success = False
         
-        # Prepare response
+        if not was_cached:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            result_key = f"results/analysis_{timestamp}_{len(postcodes_list)}_postcodes.json"
+            
+            # Save results to S3
+            save_success, saved_results = s3_manager.save_results_to_s3(model_results, result_key)
+            
+            # Generate presigned URL for result download
+            if save_success:
+                download_url = s3_manager.generate_presigned_url(result_key)
+        
+        end_time = datetime.now()
+        
+        # Calculate timing metrics
+        total_time = (end_time - start_time).total_seconds()
+        dataset_load_time_sec = (dataset_load_time - start_time).total_seconds()
+        analysis_time_sec = (analysis_time - dataset_load_time).total_seconds()
+        
+        # Get cache statistics
+        cache_stats = dataset_cache.get_cache_stats()
+        
+        # Prepare response with performance metrics
         response_data = {
             "status": "success",
             "message": f"Analysis completed for {len(postcodes_list)} postcodes",
@@ -334,9 +508,20 @@ def analyze_postcodes():
             "datasets_loaded": len(data_library),
             "s3_bucket": s3_config['bucket_name'],
             "data_directory": data_directory,
-            "result_s3_key": result_key if save_success else None,
+            # "result_s3_key": result_key if save_success else None,
             "download_url": download_url,
-            "results": json_results
+            "results": json_results,
+            # "performance_metrics": {
+            #     "total_time_seconds": round(total_time, 2),
+            #     "dataset_load_time_seconds": round(dataset_load_time_sec, 2),
+            #     "analysis_time_seconds": round(analysis_time_sec, 2),
+            #     "used_cached_datasets": dataset_cache.get(dataset_cache_key) is not None,
+            #     "used_cached_results": was_cached
+            # },
+            # "cache_statistics": {
+            #     "dataset_cache": cache_stats,
+            #     "postcode_results_cache_size": postcode_results_cache.size()
+            # }
         }
         
         return jsonify(response_data), 200
@@ -349,94 +534,60 @@ def analyze_postcodes():
             "message": "An error occurred during analysis"
         }), 500
 
-@app.route('/getlikelihoodscore', methods=['POST'])
-def get_likelihood_score():
+@app.route('/cache/status', methods=['GET'])
+def get_cache_status():
+    """Get current cache status and statistics"""
     try:
-        # Get JSON data from request
-        data = request.get_json()
+        dataset_stats = dataset_cache.get_cache_stats()
         
-        # Validate required fields
-        if not data:
-            return jsonify({
-                'error': 'No JSON data provided',
-                'status': 'error'
-            }), 400
-        
-        if 'postcode' not in data:
-            return jsonify({
-                'error': 'postcode field is required',
-                'status': 'error'
-            }), 400
-        
-        if 'category' not in data:
-            return jsonify({
-                'error': 'category field is required',
-                'status': 'error'
-            }), 400
-        
-        postcode = data['postcode']
-        category = data['category']
-        
-        # Validate data types
-        if not isinstance(postcode, list) or not isinstance(category, str):
-            return jsonify({
-                'error': 'postcode and category must be strings',
-                'status': 'error'
-            }), 400
-        
-        print(f'Processing request - Postcode: {postcode}, Category: {category}')
-        
-        # Call the API function
-        result = Api(postcode, category)
-        
-        # Check if result contains two DataFrames
-        if not isinstance(result, (list, tuple)) or len(result) != 2:
-            return jsonify({
-                'error': 'API function did not return expected format (2 DataFrames)',
-                'status': 'error'
-            }), 500
-        
-        df1, df2 = result
-        
-        # Validate that both results are DataFrames
-        if not isinstance(df1, pd.DataFrame) or not isinstance(df2, pd.DataFrame):
-            return jsonify({
-                'error': 'API function did not return DataFrames',
-                'status': 'error'
-            }), 500
-        
-        # Convert DataFrames to JSON
-        # Using 'records' orientation to get array of objects
-        df1_json = df1.to_dict('records') if not df1.empty else []
-        df2_json = df2.to_dict('records') if not df2.empty else []
-        
-        # Create response
-        response = {
-            'status': 'success',
-            'data': {
-                'postcode': postcode,
-                'category': category,
-                'dataframe1': df1_json,
-                'dataframe2': df2_json,
-                'dataframe1_shape': df1.shape,
-                'dataframe2_shape': df2.shape
-            }
-        }
-        
-        print(f'Successfully processed request for {postcode}')
-        return jsonify(response), 200
-        
-    except ImportError as e:
         return jsonify({
-            'error': f'Failed to import model: {str(e)}',
-            'status': 'error'
-        }), 500
+            "status": "success",
+            "cache_statistics": {
+                "dataset_cache": {
+                    **dataset_stats,
+                    "expiration_hours": 24
+                },
+                "postcode_results_cache": {
+                    "current_size": postcode_results_cache.size(),
+                    "max_capacity": postcode_results_cache.capacity
+                }
+            },
+            "timestamp": datetime.now().isoformat()
+        }), 200
         
     except Exception as e:
-        print(f'Error processing request: {str(e)}')
+        logging.error(f"Error getting cache status: {str(e)}")
         return jsonify({
-            'error': f'Internal server error: {str(e)}',
-            'status': 'error'
+            "status": "error",
+            "error": str(e)
+        }), 500
+
+@app.route('/cache/clear', methods=['POST'])
+def clear_cache():
+    """Clear all caches"""
+    try:
+        data = request.get_json() or {}
+        cache_type = data.get('cache_type', 'all')  # 'all', 'datasets', 'postcodes'
+        
+        if cache_type in ['all', 'datasets']:
+            dataset_cache.clear()
+            logging.info("Dataset cache cleared")
+        
+        if cache_type in ['all', 'postcodes']:
+            postcode_results_cache.clear()
+            logging.info("Postcode results cache cleared")
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Cache cleared: {cache_type}",
+            "timestamp": datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"Error clearing cache: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "error": str(e)
         }), 500
 
 @app.route('/download/<path:result_key>', methods=['POST'])
@@ -469,6 +620,5 @@ def download_result(result_key):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=3000)

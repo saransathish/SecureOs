@@ -141,52 +141,9 @@ def get_likelihood_score():
             'status': 'error'
         }), 500
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'message': 'Flask API is running'
-    }), 200
-
-@app.route('/', methods=['GET'])
-def home():
-    """Home endpoint with API documentation"""
-    return jsonify({
-        'message': 'Likelihood Score API',
-        'endpoints': {
-            'POST /getlikelihoodscore': {
-                'description': 'Get likelihood score for postcode and category',
-                'required_fields': ['postcode', 'category'],
-                'example_request': {
-                    'postcode': 'RG2 9UW',
-                    'category': 'Grocery Retail (Default)'
-                }
-            },
-            'GET /health': 'Health check endpoint'
-        }
-    }), 200
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        'error': 'Endpoint not found',
-        'status': 'error'
-    }), 404
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-    return jsonify({
-        'error': 'Method not allowed',
-        'status': 'error'
-    }), 405
 
 if __name__ == '__main__':
     print('Starting Flask API server...')
-    print('Available endpoints:')
-    print('  POST /getlikelihoodscore - Get likelihood score')
-    print('  GET /health - Health check')
-    print('  GET / - API documentation')
     
     # Run the app
     app.run(

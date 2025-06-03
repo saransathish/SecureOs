@@ -194,5 +194,8 @@ venv
 viru
 viru/
 
+.venv/
+.venv/
+
 DATA 2/
 DATA 2
